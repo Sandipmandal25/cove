@@ -55,6 +55,7 @@ ruzstd = "0.8"
 # bdk / bitcoin
 bitcoin = { version = "0.32" }
 bdk_wallet = { version = "2.3", features = ["keys-bip39", "file_store", "rusqlite"] }
+payjoin = { version = "0.25", features = ["v1"] }
 bip39 = { version = "2.2", features = ["zeroize"] }
 bip329 = { version = "0.4" }
 pubport = { version = "0.5" }
@@ -131,6 +132,7 @@ cove-http = { path = "./crates/cove-http" }
 # bitcoin
 bitcoin = { workspace = true }
 bdk_wallet = { workspace = true }
+payjoin = { workspace = true }
 bip39 = { workspace = true }
 bdk_file_store = { version = "0.21.0" }
 
