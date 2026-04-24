@@ -85,6 +85,9 @@ pub enum WalletManagerReconcileMessage {
 
     SendFlowError(SendFlowErrorAlert),
     HotWalletKeyMissing(WalletId),
+
+    PayjoinSucceeded(String),
+    PayjoinFallbackSent(String),
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, uniffi::Enum)]
@@ -666,6 +669,20 @@ impl RustWalletManager {
     pub async fn sign_and_broadcast_transaction(&self, psbt: Arc<Psbt>) -> Result<(), Error> {
         let psbt = Arc::unwrap_or_clone(psbt);
         call!(self.actor.sign_and_broadcast_transaction(psbt.into())).await.unwrap()?;
+
+        self.force_wallet_scan().await;
+
+        Ok(())
+    }
+
+    #[uniffi::method]
+    pub async fn initiate_payment(
+        &self,
+        psbt: Arc<Psbt>,
+        payjoin_uri: Option<String>,
+    ) -> Result<(), Error> {
+        let psbt = Arc::unwrap_or_clone(psbt);
+        call!(self.actor.initiate_payment(psbt.into(), payjoin_uri)).await.unwrap()?;
 
         self.force_wallet_scan().await;
 

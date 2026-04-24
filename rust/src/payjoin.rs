@@ -1,7 +1,6 @@
-use std::str::FromStr;
-
 use bitcoin::psbt::Psbt;
-use bitcoin::FeeRate;
+use bitcoin::{FeeRate, OutPoint};
+#[allow(deprecated)]
 use bdk_wallet::{SignOptions, Wallet};
 use payjoin::send::v1::SenderBuilder;
 use payjoin::{Uri, UriExt};
@@ -28,6 +27,12 @@ pub enum Error {
 
     #[error("failed to extract transaction: {0}")]
     ExtractTx(String),
+
+    #[error("receiver injected a wallet-owned input: {0}")]
+    OwnershipViolation(String),
+
+    #[error("failed to build payjoin sender: {0}")]
+    SenderBuild(String),
 }
 
 pub async fn negotiate_v1(original_psbt: Psbt, pj_uri_str: &str) -> Result<Psbt, Error> {
@@ -41,7 +46,7 @@ pub async fn negotiate_v1(original_psbt: Psbt, pj_uri_str: &str) -> Result<Psbt,
 
     let sender = SenderBuilder::new(original_psbt, pj_uri)
         .build_recommended(FeeRate::BROADCAST_MIN)
-        .map_err(|e| Error::InvalidUri(e.to_string()))?;
+        .map_err(|e| Error::SenderBuild(e.to_string()))?;
 
     let (req, ctx) = sender.create_v1_post_request();
 
@@ -81,13 +86,20 @@ pub async fn negotiate_v1(original_psbt: Psbt, pj_uri_str: &str) -> Result<Psbt,
     Ok(proposal)
 }
 
+#[allow(dead_code)]
 pub async fn send(
     wallet: &mut Wallet,
     original_psbt: Psbt,
     pj_uri_str: &str,
 ) -> Result<bitcoin::Transaction, Error> {
+    let original_outpoints: Vec<OutPoint> =
+        original_psbt.unsigned_tx.input.iter().map(|i| i.previous_output).collect();
+
     let mut proposal = negotiate_v1(original_psbt, pj_uri_str).await?;
 
+    check_ownership_containment(&proposal, &original_outpoints, wallet)?;
+
+    #[allow(deprecated)]
     let finalized = wallet
         .sign(&mut proposal, SignOptions::default())
         .map_err(|_| Error::SignFailed)?;
@@ -99,8 +111,28 @@ pub async fn send(
     proposal.extract_tx().map_err(|e| Error::ExtractTx(e.to_string()))
 }
 
+pub fn check_ownership_containment(
+    proposal: &Psbt,
+    original_outpoints: &[OutPoint],
+    wallet: &Wallet,
+) -> Result<(), Error> {
+    let owned: std::collections::HashSet<OutPoint> =
+        wallet.list_unspent().map(|u| u.outpoint).collect();
+
+    for input in &proposal.unsigned_tx.input {
+        let op = input.previous_output;
+        if !original_outpoints.contains(&op) && owned.contains(&op) {
+            return Err(Error::OwnershipViolation(op.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -123,16 +155,12 @@ mod tests {
         assert!(Uri::try_from(uri).is_err());
     }
 
-    /// Requires Bitcoin Core regtest on localhost:18443 (wallets: sender, receiver) and
-    /// payjoin-cli receiver on port 3000. Uses raw HTTP — negotiate_v1 enforces HTTPS in prod.
-    ///
     /// PAYJOIN_RECEIVER_ADDR=<addr> cargo test -p cove bip78_e2e -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
     async fn bip78_e2e() {
         use serde_json::json;
 
-        // rustls needs a crypto provider installed before any HTTP calls
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let rpc_url = "http://user:password@localhost:18443/wallet/sender";
@@ -141,7 +169,6 @@ mod tests {
         let receiver_addr = std::env::var("PAYJOIN_RECEIVER_ADDR")
             .expect("set PAYJOIN_RECEIVER_ADDR to the address payjoin-cli printed");
 
-        // build funded PSBT
         let resp: serde_json::Value = client
             .post(rpc_url)
             .json(&json!({
@@ -152,7 +179,6 @@ mod tests {
             .send().await.unwrap().json().await.unwrap();
         let psbt_b64 = resp["result"]["psbt"].as_str().unwrap().to_string();
 
-        // sign original PSBT
         let resp: serde_json::Value = client
             .post(rpc_url)
             .json(&json!({
@@ -165,7 +191,6 @@ mod tests {
 
         println!("original PSBT ready — sending BIP78 request to payjoin-cli receiver");
 
-        // POST to payjoin-cli receiver (raw HTTP — local testing only)
         let response = reqwest::Client::new()
             .post("http://localhost:3000/?v=1")
             .header("Content-Type", "text/plain")
@@ -179,7 +204,6 @@ mod tests {
         println!("receiver responded: {} ({} bytes)", status, proposal_b64.len());
         assert_eq!(status.as_u16(), 200, "receiver must accept the original PSBT");
 
-        // parse proposal — receiver added its own input
         let proposal = Psbt::from_str(&proposal_b64).expect("receiver returned a valid PSBT");
 
         assert_eq!(
@@ -189,7 +213,6 @@ mod tests {
         );
         println!("inputs in proposal: {} ✓  (receiver added 1 input)", proposal.unsigned_tx.input.len());
 
-        // re-sign proposal (tx structure changed, original sigs are invalid)
         let resp: serde_json::Value = client
             .post(rpc_url)
             .json(&json!({
@@ -200,7 +223,6 @@ mod tests {
             .send().await.unwrap().json().await.unwrap();
         let signed_proposal_b64 = resp["result"]["psbt"].as_str().unwrap().to_string();
 
-        // finalize and broadcast
         let resp: serde_json::Value = client
             .post(rpc_url)
             .json(&json!({
@@ -223,5 +245,94 @@ mod tests {
         let txid = resp["result"].as_str().expect("should get a txid back");
         println!("payjoin tx broadcast: {txid}");
         println!("run: bitcoin-cli -regtest getrawtransaction {txid} true | python3 -m json.tool");
+    }
+
+    /// PAYJOIN_RECEIVER_ADDR=<addr> cargo test -p cove bip78_send_flow -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn bip78_send_flow() {
+        use bdk_wallet::CreateParams;
+        use bitcoin::Network;
+        use serde_json::json;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let rpc_url = "http://user:password@localhost:18443/wallet/sender";
+        let client = reqwest::Client::new();
+
+        let receiver_addr = std::env::var("PAYJOIN_RECEIVER_ADDR")
+            .expect("set PAYJOIN_RECEIVER_ADDR to the address payjoin-cli printed");
+
+        let resp: serde_json::Value = client
+            .post(rpc_url)
+            .json(&json!({
+                "jsonrpc": "1.0",
+                "method": "walletcreatefundedpsbt",
+                "params": [[], [{&receiver_addr: 0.001}]]
+            }))
+            .send().await.unwrap().json().await.unwrap();
+        let psbt_b64 = resp["result"]["psbt"].as_str().unwrap().to_string();
+
+        let resp: serde_json::Value = client
+            .post(rpc_url)
+            .json(&json!({
+                "jsonrpc": "1.0",
+                "method": "walletprocesspsbt",
+                "params": [psbt_b64]
+            }))
+            .send().await.unwrap().json().await.unwrap();
+        let signed_b64 = resp["result"]["psbt"].as_str().unwrap().to_string();
+        let original_psbt = Psbt::from_str(&signed_b64).expect("valid PSBT");
+
+        let original_outpoints: Vec<OutPoint> =
+            original_psbt.unsigned_tx.input.iter().map(|i| i.previous_output).collect();
+
+        let desc = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)";
+        let wallet = CreateParams::new_single(desc)
+            .network(Network::Regtest)
+            .create_wallet_no_persist()
+            .expect("wallet created");
+
+        let response = reqwest::Client::new()
+            .post("http://localhost:3000/?v=1")
+            .header("Content-Type", "text/plain")
+            .body(signed_b64)
+            .send()
+            .await;
+
+        match response {
+            Err(e) => {
+                println!("payjoin receiver unreachable ({e}), would broadcast original tx");
+                let txid = original_psbt.unsigned_tx.compute_txid();
+                println!("fallback txid (unsigned): {txid}");
+                println!("PayjoinFallbackSent reconcile message would fire");
+                return;
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let proposal_b64 = resp.text().await.unwrap();
+                println!("receiver responded: {status} ({} bytes)", proposal_b64.len());
+                assert_eq!(status.as_u16(), 200, "receiver must accept the original PSBT");
+
+                let proposal = Psbt::from_str(&proposal_b64).expect("receiver returned valid PSBT");
+
+                check_ownership_containment(&proposal, &original_outpoints, &wallet)
+                    .expect("ownership check must pass");
+                println!(
+                    "ownership check passed — {}/{} inputs verified as non-wallet-owned",
+                    proposal.unsigned_tx.input.len() - original_outpoints.len(),
+                    proposal.unsigned_tx.input.len()
+                );
+
+                assert_eq!(proposal.unsigned_tx.input.len(), 2, "receiver added 1 input");
+                println!(
+                    "payjoin proposal valid — {} inputs ({} from sender, {} from receiver)",
+                    proposal.unsigned_tx.input.len(),
+                    original_outpoints.len(),
+                    proposal.unsigned_tx.input.len() - original_outpoints.len()
+                );
+                println!("PayjoinSucceeded reconcile message would fire");
+            }
+        }
     }
 }

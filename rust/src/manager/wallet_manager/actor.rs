@@ -589,6 +589,100 @@ impl WalletActor {
         Produces::ok(result)
     }
 
+    pub async fn initiate_payment(
+        &mut self,
+        psbt: Psbt,
+        payjoin_uri: Option<String>,
+    ) -> ActorResult<Result<(), Error>> {
+        let result = self.do_initiate_payment(psbt, payjoin_uri).await;
+        Produces::ok(result)
+    }
+
+    async fn do_initiate_payment(
+        &mut self,
+        psbt: Psbt,
+        payjoin_uri: Option<String>,
+    ) -> Result<(), Error> {
+        fn err(s: &str) -> Error {
+            Error::SignAndBroadcastError(s.to_string())
+        }
+
+        let Some(uri) = payjoin_uri else {
+            return self.do_sign_and_broadcast_transaction(psbt).await;
+        };
+
+        let network = self.wallet.network;
+        let mnemonic = Mnemonic::try_from_id(&self.wallet.metadata.id)
+            .tap_err(|error| error!("failed to get mnemonic for wallet: {error}"))
+            .map_err(|_| err("payjoin requires a hot wallet"))?;
+
+        let descriptors =
+            mnemonic.into_descriptors(None, network, self.wallet.metadata.address_type);
+        let create_params = descriptors.into_create_params().network(network.into());
+
+        let mut signing_wallet = create_params
+            .create_wallet_no_persist()
+            .tap_err(|error| error!("failed to create signing wallet: {error}"))
+            .map_err(|_| err("unable to create signing wallet"))?;
+
+        let mut original = psbt.clone();
+        #[allow(deprecated)]
+        signing_wallet
+            .sign(&mut original, SignOptions::default())
+            .tap_err(|error| error!("failed to sign original psbt: {error}"))
+            .map_err(|_| err("unable to sign original psbt"))?;
+
+        let fallback_tx = original
+            .extract_tx()
+            .tap_err(|error| error!("failed to extract fallback tx: {error}"))
+            .map_err(|e| err(&format!("unable to extract fallback tx: {e}")))?;
+
+        let original_outpoints: Vec<OutPoint> =
+            psbt.unsigned_tx.input.iter().map(|i| i.previous_output).collect();
+
+        match self.run_payjoin(psbt, &uri, &original_outpoints, &mut signing_wallet).await {
+            Ok(payjoin_tx) => {
+                let txid = payjoin_tx.compute_txid().to_string();
+                info!(txid = %txid, "payjoin succeeded");
+                self.do_broadcast_transaction(payjoin_tx.clone()).await?;
+                self.insert_broadcast_transaction(payjoin_tx).await;
+                self.send(WalletManagerReconcileMessage::PayjoinSucceeded(txid));
+            }
+            Err(e) => {
+                warn!(error = %e, "payjoin failed, broadcasting original");
+                let txid = fallback_tx.compute_txid().to_string();
+                self.do_broadcast_transaction(fallback_tx.clone()).await?;
+                self.insert_broadcast_transaction(fallback_tx).await;
+                self.send(WalletManagerReconcileMessage::PayjoinFallbackSent(txid));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_payjoin(
+        &self,
+        psbt: Psbt,
+        uri: &str,
+        original_outpoints: &[OutPoint],
+        signing_wallet: &mut bdk_wallet::Wallet,
+    ) -> Result<BdkTransaction, crate::payjoin::Error> {
+        let mut proposal = crate::payjoin::negotiate_v1(psbt, uri).await?;
+        crate::payjoin::check_ownership_containment(
+            &proposal,
+            original_outpoints,
+            &self.wallet.bdk,
+        )?;
+        #[allow(deprecated)]
+        let finalized = signing_wallet
+            .sign(&mut proposal, SignOptions::default())
+            .map_err(|_| crate::payjoin::Error::SignFailed)?;
+        if !finalized {
+            return Err(crate::payjoin::Error::SignFailed);
+        }
+        proposal.extract_tx().map_err(|e| crate::payjoin::Error::ExtractTx(e.to_string()))
+    }
+
     async fn do_sign_and_broadcast_transaction(&mut self, mut psbt: Psbt) -> Result<(), Error> {
         fn err(s: &str) -> Error {
             Error::SignAndBroadcastError(s.to_string())
