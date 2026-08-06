@@ -226,6 +226,18 @@ impl WalletActor {
         Produces::ok(())
     }
 
+    pub async fn cancel_payjoin(&mut self) -> ActorResult<Result<(), Error>> {
+        if let Some(actor) = self.payjoin_actor.take() {
+            send!(actor.cancel_and_fallback());
+        }
+        Produces::ok(Ok(()))
+    }
+
+    pub async fn notify_payjoin_polling_started(&mut self, deadline_secs: u64) -> ActorResult<()> {
+        self.send(WalletManagerReconcileMessage::PayjoinPollingStarted { deadline_secs });
+        Produces::ok(())
+    }
+
     #[into_actor_result]
     pub async fn unlocked_trusted_spendable_balance(&mut self) -> Result<Amount, Error> {
         self.unlocked_trusted_spendable_balance_inner()

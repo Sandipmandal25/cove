@@ -118,6 +118,9 @@ class WalletManager :
     // TaggedItem ensures a new unique key each time so Compose always re-fires the observer
     var payjoinTxBroadcast by mutableStateOf<TaggedItem<Unit>?>(null)
 
+    // epoch seconds when the payjoin session will expire, set when polling starts
+    var payjoinDeadlineSecs by mutableStateOf<ULong?>(null)
+
     // cached transaction detail presentations (observable for Compose)
     val transactionDetailsPresentations: SnapshotStateMap<TxId, TransactionDetailsPresentation> =
         mutableStateMapOf()
@@ -539,6 +542,12 @@ class WalletManager :
         }
     }
 
+    suspend fun cancelPayjoin() {
+        withRustSuspend {
+            cancelPayjoin()
+        }
+    }
+
     fun displayConfirmationCount(confirmations: UInt): String =
         withRustOr("") {
             displayConfirmationCount(confirmations)
@@ -898,6 +907,11 @@ class WalletManager :
 
             is WalletManagerReconcileMessage.PayjoinTxBroadcast -> {
                 payjoinTxBroadcast = TaggedItem(Unit)
+                payjoinDeadlineSecs = null
+            }
+
+            is WalletManagerReconcileMessage.PayjoinPollingStarted -> {
+                payjoinDeadlineSecs = message.deadlineSecs
             }
         }
     }
